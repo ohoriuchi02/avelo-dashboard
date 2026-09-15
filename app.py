@@ -83,15 +83,12 @@ else:
 DEFAULT_CLUSTER_RADIUS_NM = 50
 MIN_MARKET_CIRCLE_RADIUS_NM = 0.5
 MAX_MARKET_CIRCLE_RADIUS_NM = 60
-# Circle size is relative to this reference passenger count, not an absolute
-# per-passenger increment -- a market AT this many passengers gets the full
-# 60nm circle; everything below scales down smoothly (sqrt curve). Tune this
-# in the sidebar against your real data: set it to roughly the total_pax of
-# your biggest true hub markets (ATL, LGA, LAX, MCO, etc.) so ONLY markets in
-# that tier reach the max circle, rather than every mid-size market maxing
-# out. There's no way to pick this correctly without seeing your actual
-# passenger figures, hence it's exposed as a live control rather than fixed.
-DEFAULT_REFERENCE_MAX_PAX = 50000
+# Fallback only, used if the demand file is ever empty/unavailable when this
+# is referenced. In normal operation, the actual reference value used is
+# computed live from the loaded demand data (the single largest market's
+# passenger count, dataset-wide) -- see FALLBACK_REFERENCE_MAX_PAX usage in
+# the UI section below, not this constant.
+FALLBACK_REFERENCE_MAX_PAX = 50000
 DEFAULT_ORIGIN_CIRCLE_RADIUS_NM = 50
 
 # elevation-adjusted required takeoff field length curves, for the raw-file
@@ -163,7 +160,7 @@ def get_destination_clusters_by_origin(origin_ident, demand_df, airports_df,
                                         manual_origin_market=None,
                                         cluster_radius_nm=DEFAULT_CLUSTER_RADIUS_NM,
                                         origin_cluster_radius_nm=None,
-                                        reference_max_pax=DEFAULT_REFERENCE_MAX_PAX):
+                                        reference_max_pax=FALLBACK_REFERENCE_MAX_PAX):
     empty_result = pd.DataFrame(columns=["anchor_airport", "anchor_lat", "anchor_lon",
                                           "total_pax", "avg_fare", "member_airports",
                                           "circle_radius_nm"])
@@ -226,15 +223,17 @@ def get_destination_clusters_by_origin(origin_ident, demand_df, airports_df,
         weights = [m["total_pax"] for m in members]
         avg_fare = np.average(fares, weights=weights) if total_pax > 0 else float(np.mean(fares))
 
-        # Relative to reference_max_pax, not an absolute per-passenger rate --
-        # a market AT reference_max_pax gets the full 60nm circle, everything
-        # below scales down on a sqrt curve. Ratio is capped at 1.0 so a
-        # market larger than the reference still just gets the max circle,
-        # not an oversized one.
+        # Relative to reference_max_pax (the single largest market in the
+        # whole dataset), scaled LINEARLY -- a market at reference_max_pax
+        # gets the full 60nm circle, and every other market's circle is that
+        # same fraction of 60nm as its share of the largest market's
+        # passengers. Ratio is capped at 1.0 as a safety margin only (it
+        # should never exceed 1.0 by construction, since reference_max_pax
+        # IS the dataset max).
         pax_ratio = min(total_pax / reference_max_pax, 1.0) if reference_max_pax > 0 else 0.0
         circle_radius_nm = MIN_MARKET_CIRCLE_RADIUS_NM + (
             MAX_MARKET_CIRCLE_RADIUS_NM - MIN_MARKET_CIRCLE_RADIUS_NM
-        ) * np.sqrt(pax_ratio)
+        ) * pax_ratio
 
         clusters.append({
             "anchor_airport": ident,
@@ -255,7 +254,7 @@ def plot_market_circles(origin_ident, airports_df, demand_df,
                          origin_cluster_radius_nm=None,
                          show_origin_circle=True,
                          origin_circle_radius_nm=DEFAULT_ORIGIN_CIRCLE_RADIUS_NM,
-                         reference_max_pax=DEFAULT_REFERENCE_MAX_PAX,
+                         reference_max_pax=FALLBACK_REFERENCE_MAX_PAX,
                          zoom_start=4, save_path=None):
     origin = airports_df[airports_df["IDENT"] == origin_ident]
     if origin.empty:
@@ -379,9 +378,10 @@ def plot_market_circles(origin_ident, airports_df, demand_df,
         ).add_to(m)
 
     legend_html = f"""
-    <div style="position: fixed; bottom: 30px; left: 30px; z-index:9999;
-                background: white; padding: 10px 14px; border-radius: 6px;
-                box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 13px; color: #000000;">
+    <div style="position: fixed; bottom: 20px; left: 20px; z-index:9999;
+                background: white; padding: 5px 7px; border-radius: 4px;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.3); font-size: 10px; color: #000000;
+                line-height: 1.35;">
         <b>{origin_ident} Demand Map</b><br>
         <span style="color:#3388ff;">- - -</span> {origin_circle_radius_nm} nm clustering reference circle<br>
         &#9679; Black = MTOW-capable route (both ends) &nbsp; &#9679; <span style="color:{RESTRICTED_DOT_COLOR};">Orange</span> = Restricted-capable route (both ends)<br>
@@ -488,51 +488,30 @@ with st.sidebar:
     default_index = idents.index("TKI") if "TKI" in idents else 0
     origin = st.selectbox("Origin airport (IDENT)", idents, index=default_index)
 
-    st.subheader("Clustering")
-    cluster_radius_nm = st.slider(
-        "Cluster radius (nm)", min_value=10, max_value=150,
-        value=DEFAULT_CLUSTER_RADIUS_NM, step=5,
-        help="Airports within this distance of each other are treated as one market, "
-             "on both the origin side (pulls in nearby airports' demand rows) and the "
-             "destination side (e.g. groups MCO and SFB into one circle).",
-    )
-    show_origin_circle = st.checkbox("Show clustering reference circle", value=True)
-
-    st.subheader("Circle sizing")
-    reference_max_pax = st.number_input(
-        "Passengers for max circle (60nm)",
-        min_value=1000, max_value=1_000_000,
-        value=DEFAULT_REFERENCE_MAX_PAX, step=1000,
-        help="A market at this many passengers (scaled to 100%) gets the full 60nm "
-             "circle; smaller markets scale down smoothly. Tune this against your own "
-             "data: pick an origin with a known mega-hub market (ATL, LGA, LAX, MCO, "
-             "etc.), note that market's passenger total below, and set this close to "
-             "it so only markets in that tier reach the max circle.",
-    )
-
-    with st.expander("Advanced"):
-        manual_market_str = st.text_input(
-            "Manual origin market override",
-            value="",
-            help="Bypasses geographic clustering and filters demand to this exact "
-                 "market code instead. Leave blank to use geographic clustering.",
-        )
-        manual_market = int(manual_market_str) if manual_market_str.strip().isdigit() else None
-
     st.divider()
     st.caption(
         "Built with Streamlit + folium. Data: FAA airport/runway data and DOT DB1B "
         "market data. Portfolio project by Otto Horiuchi."
     )
 
+# Fixed, not user-adjustable (see DEFAULT_CLUSTER_RADIUS_NM in the config
+# section): airports within this many nm of each other are treated as one
+# market on both the origin and destination side.
+#
+# Origin reference circle is always shown, at that same radius.
+#
+# Circle sizing reference is computed live from the loaded data: the single
+# largest market (Apt1->Apt2 passenger total, already scaled to 100%)
+# anywhere in the whole demand file gets the full 60nm circle, and every
+# other market scales linearly off that same number.
+dataset_max_pax = demand[PAX_COL].max() if not demand.empty else FALLBACK_REFERENCE_MAX_PAX
+
 try:
     m, others, clusters = plot_market_circles(
         origin, airports, demand,
-        manual_origin_market=manual_market,
-        cluster_radius_nm=cluster_radius_nm,
-        show_origin_circle=show_origin_circle,
-        origin_circle_radius_nm=cluster_radius_nm,
-        reference_max_pax=reference_max_pax,
+        cluster_radius_nm=DEFAULT_CLUSTER_RADIUS_NM,
+        origin_circle_radius_nm=DEFAULT_CLUSTER_RADIUS_NM,
+        reference_max_pax=dataset_max_pax,
     )
 except ValueError as e:
     st.error(str(e))
