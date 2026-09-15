@@ -80,7 +80,15 @@ else:
     CARTO_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}"
     CARTO_ATTR = "Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ"
 
-DEFAULT_CLUSTER_RADIUS_NM = 50
+# 50nm was too tight for real-world cases like HVN (Tweed New Haven) -> NYC:
+# HVN sits 53.5nm from LGA, 55.1nm from JFK, and 67.6nm from EWR, all outside
+# a 50nm radius, so none of that demand was being pulled in even though HVN
+# is explicitly marketed as an NYC-area airport. 90nm comfortably covers all
+# three NYC-area fields from HVN with margin. This affects clustering
+# dataset-wide (both origin-side pooling and destination-side market
+# grouping), not just HVN -- if it over-merges distinct markets elsewhere,
+# this is the one constant to dial back down.
+DEFAULT_CLUSTER_RADIUS_NM = 60
 MIN_MARKET_CIRCLE_RADIUS_NM = 0.5
 MAX_MARKET_CIRCLE_RADIUS_NM = 60
 # Fallback only, used if the demand file is ever empty/unavailable when this
@@ -98,7 +106,14 @@ RESTRICTED_TOFL_M = {0: 1250, 2000: 1375, 4000: 1500}
 _ALTS_FT = np.array(sorted(RESTRICTED_TOFL_M.keys()))
 _RESTRICTED_TOFL_FT = np.array([RESTRICTED_TOFL_M[a] for a in _ALTS_FT]) * M_TO_FT
 TOFL_CURVES_M = {
-    0: [(34000, 965), (48000, 1300), (55000, 1550), (61500, 1843)],
+    # Sea-level entry corrected to Embraer's official E195-E2 spec sheet
+    # (embraer.com/media/ue1bdfnq/e195-e2-spec-1.pdf): MTOW 62,500 kg,
+    # Takeoff Field Length at MTOW/ISA/SL = 1,775 m / 5,823 ft. The prior
+    # value (61,500 kg / 1,843 m / 6,047 ft) didn't match any published
+    # source and also broke the range formula's calibration -- 5,823 ft
+    # correctly yields ~3,000nm (the E195-E2's actual published range),
+    # 6,047 ft overstated it to ~3,326nm.
+    0: [(34000, 965), (48000, 1300), (55000, 1550), (62500, 1775)],
     2000: [(34000, 985), (48000, 1420), (55000, 1700), (61500, 2020)],
     4000: [(34000, 1010), (48000, 1560), (55000, 1880), (61500, 2229)],
 }
@@ -111,6 +126,34 @@ def required_restricted_ft(elevation_ft):
 
 def required_mtow_ft(elevation_ft):
     return np.interp(elevation_ft, _ALTS_FT, _TOFL_AT_MTOW_FT)
+
+
+# "Restricted" case is defined as full-pax with 500nm reserve fuel; MTOW case
+# tops out at the E195-E2's published full-pax range (embraer.com/media/
+# ue1bdfnq/e195-e2-spec-1.pdf). These two (runway length -> range) pairs are
+# the calibration anchors for compute_range_nm below.
+RESTRICTED_RANGE_NM = 500
+MTOW_RANGE_NM = 3000
+
+
+def compute_range_nm(length_ft, required_restricted_ft_val, required_mtow_ft_val):
+    """
+    Elevation-aware achievable range for a given runway.
+
+    Linearly interpolates between two reference points -- (required_restricted
+    runway length -> 500nm) and (required_MTOW runway length -> 3000nm) --
+    using THIS AIRPORT'S OWN elevation-adjusted required-runway values, not
+    fixed sea-level thresholds. A runway that only just clears its local
+    (elevation-adjusted) MTOW bar gets correctly less range than the same
+    length runway at sea level, since required_restricted_ft_val and
+    required_mtow_ft_val are themselves already elevation-adjusted per airport.
+
+    Capped at MTOW_RANGE_NM -- extra runway beyond what MTOW needs doesn't
+    buy more range than the aircraft's own published ceiling.
+    """
+    slope = (MTOW_RANGE_NM - RESTRICTED_RANGE_NM) / (required_mtow_ft_val - required_restricted_ft_val)
+    range_nm = RESTRICTED_RANGE_NM + slope * (length_ft - required_restricted_ft_val)
+    return np.minimum(range_nm, MTOW_RANGE_NM)
 
 
 # ============================================================
@@ -457,7 +500,9 @@ def load_data():
         choicelist=["MTOW", "RESTRICTED"],
         default="INSUFFICIENT",
     )
-    airports["range"] = (1.452 * airports["LENGTH"] - 5454).clip(upper=3000)
+    airports["range"] = compute_range_nm(
+        airports["LENGTH"], airports["required_restricted"], airports["required_MTOW"]
+    )
     airports = airports[~airports["IDENT"].str.contains(r"\d", na=False)]
 
     demand = pd.read_excel(markets_xlsx)
