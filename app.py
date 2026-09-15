@@ -519,6 +519,7 @@ st.caption(
     "Dot color = route capability (the weaker of the origin's and destination's own "
     "runway capability). Filled = reachable to AND from origin. Shaded circles = "
     "geographically clustered destination market demand."
+    "Note: airports above 4000ft elevation excluded due to complex TOFL data"
 )
 
 try:
